@@ -14,6 +14,27 @@ fi
 # Discard stdin. Needed when running from a one-liner which includes a newline
 read -N 999999 -t 0.001
 
+# Function to validate IP address
+validate_ip() {
+	local ip=$1
+	local valid=1
+
+	# Check format
+	if [[ $ip =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+		IFS='.' read -ra ADDR <<< "$ip"
+		for i in "${ADDR[@]}"; do
+			if [[ $i -gt 255 ]]; then
+				valid=0
+				break
+			fi
+		done
+	else
+		valid=0
+	fi
+
+	return $valid
+}
+
 # Detect OS
 # $os_version variables aren't always in use, but are kept here for convenience
 if grep -qs "ubuntu" /etc/os-release; then
@@ -114,7 +135,7 @@ if [[ ! -e /etc/openvpn/server/server.conf ]]; then
 		echo
 		echo "This server is behind NAT. What is the public IPv4 address or hostname?"
 		# Get public IP and sanitize with grep
-		get_public_ip=$(grep -m 1 -oE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' <<< "$(wget -T 10 -t 1 -4qO- "http://ip1.dynupdate.no-ip.com/" || curl -m 10 -4Ls "http://ip1.dynupdate.no-ip.com/")")
+		get_public_ip=$(grep -m 1 -oE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' <<< "$(wget -T 10 -t 1 -4qO- "https://api.ipify.org" || curl -m 10 -4Ls "https://api.ipify.org")")
 		read -p "Public IPv4 address / hostname [$get_public_ip]: " public_ip
 		# If the checkip service is unavailable and user didn't provide input, ask again
 		until [[ -n "$get_public_ip" || -n "$public_ip" ]]; do
@@ -190,26 +211,37 @@ if [[ ! -e /etc/openvpn/server/server.conf ]]; then
 			# Convert comma delimited to space delimited
 			dns_input=$(echo "$dns_input" | tr ',' ' ')
 			# Validate and build custom DNS IP list
+			invalid_ips=""
 			for dns_ip in $dns_input; do
-				if [[ "$dns_ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+				if validate_ip "$dns_ip"; then
 					if [[ -z "$custom_dns" ]]; then
 						custom_dns="$dns_ip"
 					else
 						custom_dns="$custom_dns $dns_ip"
 					fi
+				else
+					invalid_ips="$invalid_ips $dns_ip"
 				fi
 			done
 			if [ -z "$custom_dns" ]; then
-				echo "Invalid input."
+				echo "Invalid input. No valid IP addresses found."
+				if [[ -n "$invalid_ips" ]]; then
+					echo "Invalid IPs:$invalid_ips"
+				fi
 			fi
 		done
 	fi
 	echo
 	echo "Enter a name for the first client:"
 	read -p "Name [client]: " unsanitized_client
-	# Allow a limited set of characters to avoid conflicts
+	# Allow a limited set of characters to avoid conflicts and ensure minimum length
 	client=$(sed 's/[^0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-]/_/g' <<< "$unsanitized_client")
-	[[ -z "$client" ]] && client="client"
+	# Ensure client name is at least 3 characters and starts with a letter
+	while [[ -z "$client" || ${#client} -lt 3 || ! "$client" =~ ^[a-zA-Z] ]]; do
+		echo "Client name must be at least 3 characters and start with a letter."
+		read -p "Name: " unsanitized_client
+		client=$(sed 's/[^0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-]/_/g' <<< "$unsanitized_client")
+	done
 	echo
 	echo "OpenVPN installation is ready to begin."
 	# Install a firewall if firewalld or iptables are not already available
@@ -247,36 +279,48 @@ LimitNPROC=infinity" > /etc/systemd/system/openvpn-server@server.service.d/disab
 	fi
 	# Get easy-rsa
 	easy_rsa_url='https://github.com/OpenVPN/easy-rsa/releases/download/v3.2.4/EasyRSA-3.2.4.tgz'
+	easy_rsa_sha256='1b01bafe1bd8ae23ac2cfc4f36f73d5ebdc9bc19c4ddf26d3d9dbd0a24e8ade9'
 	mkdir -p /etc/openvpn/server/easy-rsa/
-	{ wget -qO- "$easy_rsa_url" 2>/dev/null || curl -sL "$easy_rsa_url" ; } | tar xz -C /etc/openvpn/server/easy-rsa/ --strip-components 1
+	# Download and verify checksum
+	easy_rsa_file="/tmp/EasyRSA-3.2.4.tgz"
+	if wget -qO "$easy_rsa_file" "$easy_rsa_url" 2>/dev/null || curl -sL "$easy_rsa_url" -o "$easy_rsa_file"; then
+		downloaded_sha256=$(sha256sum "$easy_rsa_file" | cut -d ' ' -f 1)
+		if [[ "$downloaded_sha256" != "$easy_rsa_sha256" ]]; then
+			echo "Error: Easy-RSA checksum verification failed!"
+			echo "Expected: $easy_rsa_sha256"
+			echo "Got: $downloaded_sha256"
+			rm -f "$easy_rsa_file"
+			exit 1
+		fi
+		tar xz -C /etc/openvpn/server/easy-rsa/ --strip-components 1 -f "$easy_rsa_file"
+		rm -f "$easy_rsa_file"
+	else
+		echo "Error: Failed to download Easy-RSA"
+		exit 1
+	fi
 	chown -R root:root /etc/openvpn/server/easy-rsa/
 	cd /etc/openvpn/server/easy-rsa/
 	# Create the PKI, set up the CA and create TLS key
 	./easyrsa --batch init-pki
 	./easyrsa --batch build-ca nopass
 	./easyrsa gen-tls-crypt-key
-	# Create the DH parameters file using the predefined ffdhe2048 group
-	echo '-----BEGIN DH PARAMETERS-----
-MIIBCAKCAQEA//////////+t+FRYortKmq/cViAnPTzx2LnFg84tNpWp4TZBFGQz
-+8yTnc4kmz75fS/jY2MMddj2gbICrsRhetPfHtXV/WVhJDP1H18GbtCFY2VVPe0a
-87VXE15/V8k1mE8McODmi3fipona8+/och3xWKE2rec1MKzKT0g6eXq8CrGCsyT7
-YdEIqUuyyOP7uWrat2DX9GgdT0Kj3jlN9K5W7edjcrsZCwenyO4KbXCeAvzhzffi
-7MA0BM0oNC9hkXL+nOmFg/+OTxIy7vKBg8P+OxtMb61zO7X8vC7CIAXFjvGDfRaD
-ssbzSibBsu/6iGtCOGEoXJf//////////wIBAg==
------END DH PARAMETERS-----' > /etc/openvpn/server/dh.pem
+	# Generate DH parameters (this may take a while)
+	echo "Generating DH parameters (this may take several minutes)..."
+	openssl dhparam -out /etc/openvpn/server/dh.pem 2048
 	# Make easy-rsa aware of our external DH file (prevents a warning)
 	ln -s /etc/openvpn/server/dh.pem pki/dh.pem
 	# Create certificates and CRL
-	./easyrsa --batch --days=3650 build-server-full server nopass
-	./easyrsa --batch --days=3650 build-client-full "$client" nopass
-	./easyrsa --batch --days=3650 gen-crl
+	./easyrsa --batch --days=730 build-server-full server nopass
+	./easyrsa --batch --days=730 build-client-full "$client"
+	./easyrsa --batch --days=730 gen-crl
 	# Move the stuff we need
 	cp pki/ca.crt pki/private/ca.key pki/issued/server.crt pki/private/server.key pki/crl.pem /etc/openvpn/server
 	cp pki/private/easyrsa-tls.key /etc/openvpn/server/tc.key
 	# CRL is read with each client connection, while OpenVPN is dropped to nobody
 	chown nobody:"$group_name" /etc/openvpn/server/crl.pem
-	# Without +x in the directory, OpenVPN can't run a stat() on the CRL file
-	chmod o+x /etc/openvpn/server/
+	# Set proper directory permissions - allow nobody group to access CRL file
+	chmod 755 /etc/openvpn/server/
+	chmod 644 /etc/openvpn/server/crl.pem
 	# Generate server.conf
 	echo "local $ip
 port $port
@@ -287,6 +331,8 @@ cert server.crt
 key server.key
 dh dh.pem
 auth SHA512
+cipher AES-256-GCM
+tls-version-min 1.2
 tls-crypt tc.key
 topology subnet
 server 10.8.0.0 255.255.255.0" > /etc/openvpn/server/server.conf
@@ -349,8 +395,11 @@ user nobody
 group $group_name
 persist-key
 persist-tun
-verb 3
-crl-verify crl.pem" >> /etc/openvpn/server/server.conf
+verb 1
+crl-verify crl.pem
+reneg-sec 3600
+tls-auth ta.key 0
+key-direction 0" >> /etc/openvpn/server/server.conf
 	if [[ "$protocol" = "udp" ]]; then
 		echo "explicit-exit-notify" >> /etc/openvpn/server/server.conf
 	fi
@@ -369,18 +418,18 @@ crl-verify crl.pem" >> /etc/openvpn/server/server.conf
 		# reload.
 		# We don't use --add-service=openvpn because that would only work with
 		# the default port and protocol.
-		firewall-cmd --add-port="$port"/"$protocol"
+		firewall-cmd --add-port="${port}/${protocol}"
 		firewall-cmd --zone=trusted --add-source=10.8.0.0/24
-		firewall-cmd --permanent --add-port="$port"/"$protocol"
+		firewall-cmd --permanent --add-port="${port}/${protocol}"
 		firewall-cmd --permanent --zone=trusted --add-source=10.8.0.0/24
 		# Set NAT for the VPN subnet
-		firewall-cmd --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to "$ip"
-		firewall-cmd --permanent --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to "$ip"
+		firewall-cmd --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to "${ip}"
+		firewall-cmd --permanent --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to "${ip}"
 		if [[ -n "$ip6" ]]; then
 			firewall-cmd --zone=trusted --add-source=fddd:1194:1194:1194::/64
 			firewall-cmd --permanent --zone=trusted --add-source=fddd:1194:1194:1194::/64
-			firewall-cmd --direct --add-rule ipv6 nat POSTROUTING 0 -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to "$ip6"
-			firewall-cmd --permanent --direct --add-rule ipv6 nat POSTROUTING 0 -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to "$ip6"
+			firewall-cmd --direct --add-rule ipv6 nat POSTROUTING 0 -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to "${ip6}"
+			firewall-cmd --permanent --direct --add-rule ipv6 nat POSTROUTING 0 -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to "${ip6}"
 		fi
 	else
 		# Create a service to set up persistent iptables rules
@@ -397,21 +446,21 @@ After=network-online.target
 Wants=network-online.target
 [Service]
 Type=oneshot
-ExecStart=$iptables_path -w 5 -t nat -A POSTROUTING -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to $ip
-ExecStart=$iptables_path -w 5 -I INPUT -p $protocol --dport $port -j ACCEPT
-ExecStart=$iptables_path -w 5 -I FORWARD -s 10.8.0.0/24 -j ACCEPT
-ExecStart=$iptables_path -w 5 -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
-ExecStop=$iptables_path -w 5 -t nat -D POSTROUTING -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to $ip
-ExecStop=$iptables_path -w 5 -D INPUT -p $protocol --dport $port -j ACCEPT
-ExecStop=$iptables_path -w 5 -D FORWARD -s 10.8.0.0/24 -j ACCEPT
-ExecStop=$iptables_path -w 5 -D FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT" > /etc/systemd/system/openvpn-iptables.service
+ExecStart=${iptables_path} -w 5 -t nat -A POSTROUTING -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to ${ip}
+ExecStart=${iptables_path} -w 5 -I INPUT -p ${protocol} --dport ${port} -j ACCEPT
+ExecStart=${iptables_path} -w 5 -I FORWARD -s 10.8.0.0/24 -j ACCEPT
+ExecStart=${iptables_path} -w 5 -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
+ExecStop=${iptables_path} -w 5 -t nat -D POSTROUTING -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to ${ip}
+ExecStop=${iptables_path} -w 5 -D INPUT -p ${protocol} --dport ${port} -j ACCEPT
+ExecStop=${iptables_path} -w 5 -D FORWARD -s 10.8.0.0/24 -j ACCEPT
+ExecStop=${iptables_path} -w 5 -D FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT" > /etc/systemd/system/openvpn-iptables.service
 		if [[ -n "$ip6" ]]; then
-			echo "ExecStart=$ip6tables_path -w 5 -t nat -A POSTROUTING -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to $ip6
-ExecStart=$ip6tables_path -w 5 -I FORWARD -s fddd:1194:1194:1194::/64 -j ACCEPT
-ExecStart=$ip6tables_path -w 5 -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
-ExecStop=$ip6tables_path -w 5 -t nat -D POSTROUTING -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to $ip6
-ExecStop=$ip6tables_path -w 5 -D FORWARD -s fddd:1194:1194:1194::/64 -j ACCEPT
-ExecStop=$ip6tables_path -w 5 -D FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT" >> /etc/systemd/system/openvpn-iptables.service
+			echo "ExecStart=${ip6tables_path} -w 5 -t nat -A POSTROUTING -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to ${ip6}
+ExecStart=${ip6tables_path} -w 5 -I FORWARD -s fddd:1194:1194:1194::/64 -j ACCEPT
+ExecStart=${ip6tables_path} -w 5 -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
+ExecStop=${ip6tables_path} -w 5 -t nat -D POSTROUTING -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to ${ip6}
+ExecStop=${ip6tables_path} -w 5 -D FORWARD -s fddd:1194:1194:1194::/64 -j ACCEPT
+ExecStop=${ip6tables_path} -w 5 -D FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT" >> /etc/systemd/system/openvpn-iptables.service
 		fi
 		echo "RemainAfterExit=yes
 [Install]
@@ -424,7 +473,10 @@ WantedBy=multi-user.target" >> /etc/systemd/system/openvpn-iptables.service
 		if ! hash semanage 2>/dev/null; then
 				dnf install -y policycoreutils-python-utils
 		fi
-		semanage port -a -t openvpn_port_t -p "$protocol" "$port"
+		if ! semanage port -a -t openvpn_port_t -p "${protocol}" "${port}" 2>/dev/null; then
+			echo "Warning: Failed to add SELinux port policy. OpenVPN may not start correctly."
+			echo "You may need to manually configure SELinux with: semanage port -a -t openvpn_port_t -p ${protocol} ${port}"
+		fi
 	fi
 	# If the server is behind NAT, use the correct IP address
 	[[ -n "$public_ip" ]] && ip="$public_ip"
@@ -440,11 +492,13 @@ persist-tun
 remote-cert-tls server
 auth SHA512
 ignore-unknown-option block-outside-dns
-verb 3" > /etc/openvpn/server/client-common.txt
+verb 1" > /etc/openvpn/server/client-common.txt
 	# Enable and start the OpenVPN service
 	systemctl enable --now openvpn-server@server.service
 	# Build the $client.ovpn file, stripping comments from easy-rsa in the process
 	grep -vh '^#' /etc/openvpn/server/client-common.txt /etc/openvpn/server/easy-rsa/pki/inline/private/"$client".inline > "$script_dir"/"$client".ovpn
+	# Set secure permissions on the client configuration file
+	chmod 600 "$script_dir"/"$client".ovpn
 	echo
 	echo "Finished!"
 	echo
@@ -470,15 +524,21 @@ else
 			echo "Provide a name for the client:"
 			read -p "Name: " unsanitized_client
 			client=$(sed 's/[^0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-]/_/g' <<< "$unsanitized_client")
-			while [[ -z "$client" || -e /etc/openvpn/server/easy-rsa/pki/issued/"$client".crt ]]; do
-				echo "$client: invalid name."
+			while [[ -z "$client" || ${#client} -lt 3 || ! "$client" =~ ^[a-zA-Z] || -e /etc/openvpn/server/easy-rsa/pki/issued/"$client".crt ]]; do
+				if [[ -z "$client" || ${#client} -lt 3 || ! "$client" =~ ^[a-zA-Z] ]]; then
+					echo "Client name must be at least 3 characters and start with a letter."
+				else
+					echo "$client: name already exists."
+				fi
 				read -p "Name: " unsanitized_client
 				client=$(sed 's/[^0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-]/_/g' <<< "$unsanitized_client")
 			done
 			cd /etc/openvpn/server/easy-rsa/
-			./easyrsa --batch --days=3650 build-client-full "$client" nopass
+			./easyrsa --batch --days=730 build-client-full "$client"
 			# Build the $client.ovpn file, stripping comments from easy-rsa in the process
 			grep -vh '^#' /etc/openvpn/server/client-common.txt /etc/openvpn/server/easy-rsa/pki/inline/private/"$client".inline > "$script_dir"/"$client".ovpn
+			# Set secure permissions on the client configuration file
+			chmod 600 "$script_dir"/"$client".ovpn
 			echo
 			echo "$client added. Configuration available in:" "$script_dir"/"$client.ovpn"
 			exit
@@ -510,7 +570,7 @@ else
 			if [[ "$revoke" =~ ^[yY]$ ]]; then
 				cd /etc/openvpn/server/easy-rsa/
 				./easyrsa --batch revoke "$client"
-				./easyrsa --batch --days=3650 gen-crl
+				./easyrsa --batch --days=730 gen-crl
 				rm -f /etc/openvpn/server/crl.pem
 				rm -f /etc/openvpn/server/easy-rsa/pki/reqs/"$client".req
 				rm -f /etc/openvpn/server/easy-rsa/pki/private/"$client".key
@@ -538,25 +598,27 @@ else
 				if systemctl is-active --quiet firewalld.service; then
 					ip=$(firewall-cmd --direct --get-rules ipv4 nat POSTROUTING | grep '\-s 10.8.0.0/24 '"'"'!'"'"' -d 10.8.0.0/24' | grep -oE '[^ ]+$')
 					# Using both permanent and not permanent rules to avoid a firewalld reload.
-					firewall-cmd --remove-port="$port"/"$protocol"
+					firewall-cmd --remove-port="${port}/${protocol}"
 					firewall-cmd --zone=trusted --remove-source=10.8.0.0/24
-					firewall-cmd --permanent --remove-port="$port"/"$protocol"
+					firewall-cmd --permanent --remove-port="${port}/${protocol}"
 					firewall-cmd --permanent --zone=trusted --remove-source=10.8.0.0/24
-					firewall-cmd --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to "$ip"
-					firewall-cmd --permanent --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to "$ip"
+					firewall-cmd --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to "${ip}"
+					firewall-cmd --permanent --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to "${ip}"
 					if grep -qs "server-ipv6" /etc/openvpn/server/server.conf; then
 						ip6=$(firewall-cmd --direct --get-rules ipv6 nat POSTROUTING | grep '\-s fddd:1194:1194:1194::/64 '"'"'!'"'"' -d fddd:1194:1194:1194::/64' | grep -oE '[^ ]+$')
 						firewall-cmd --zone=trusted --remove-source=fddd:1194:1194:1194::/64
 						firewall-cmd --permanent --zone=trusted --remove-source=fddd:1194:1194:1194::/64
-						firewall-cmd --direct --remove-rule ipv6 nat POSTROUTING 0 -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to "$ip6"
-						firewall-cmd --permanent --direct --remove-rule ipv6 nat POSTROUTING 0 -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to "$ip6"
+						firewall-cmd --direct --remove-rule ipv6 nat POSTROUTING 0 -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to "${ip6}"
+						firewall-cmd --permanent --direct --remove-rule ipv6 nat POSTROUTING 0 -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to "${ip6}"
 					fi
 				else
 					systemctl disable --now openvpn-iptables.service
 					rm -f /etc/systemd/system/openvpn-iptables.service
 				fi
 				if sestatus 2>/dev/null | grep "Current mode" | grep -q "enforcing" && [[ "$port" != 1194 ]]; then
-					semanage port -d -t openvpn_port_t -p "$protocol" "$port"
+					if ! semanage port -d -t openvpn_port_t -p "${protocol}" "${port}" 2>/dev/null; then
+						echo "Warning: Failed to remove SELinux port policy."
+					fi
 				fi
 				systemctl disable --now openvpn-server@server.service
 				rm -f /etc/systemd/system/openvpn-server@server.service.d/disable-limitnproc.conf
