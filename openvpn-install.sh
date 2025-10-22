@@ -276,7 +276,7 @@ LimitNPROC=infinity" > /etc/systemd/system/openvpn-server@server.service.d/disab
 	fi
 	# Get easy-rsa
 	easy_rsa_url='https://github.com/OpenVPN/easy-rsa/releases/download/v3.2.4/EasyRSA-3.2.4.tgz'
-	easy_rsa_sha256='ed65e88cea892268efa71eb1161ce13af3beded6754301e1e713e36ff3613cac'
+	easy_rsa_sha256='1b01bafe1bd8ae23ac2cfc4f36f73d5ebdc9bc19c4ddf26d3d9dbd0a24e8ade9'
 	mkdir -p /etc/openvpn/server/easy-rsa/
 	# Download and verify checksum
 	easy_rsa_file="/tmp/EasyRSA-3.2.4.tgz"
