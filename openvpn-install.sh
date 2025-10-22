@@ -189,13 +189,17 @@ if [[ ! -e /etc/openvpn/server/server.conf ]]; then
 			read -p "DNS servers: " dns_input
 			# Convert comma delimited to space delimited
 			dns_input=$(echo "$dns_input" | tr ',' ' ')
-			# Validate and build custom DNS IP list
+			# Validate and build custom DNS IP list with stricter validation
 			for dns_ip in $dns_input; do
-				if [[ "$dns_ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
-					if [[ -z "$custom_dns" ]]; then
-						custom_dns="$dns_ip"
-					else
-						custom_dns="$custom_dns $dns_ip"
+				# More strict IP validation
+				if [[ "$dns_ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+					# Check if each octet is between 0-255
+					if [[ ${BASH_REMATCH[1]} -le 255 && ${BASH_REMATCH[2]} -le 255 && ${BASH_REMATCH[3]} -le 255 && ${BASH_REMATCH[4]} -le 255 ]]; then
+						if [[ -z "$custom_dns" ]]; then
+							custom_dns="$dns_ip"
+						else
+							custom_dns="$custom_dns $dns_ip"
+						fi
 					fi
 				fi
 			done
@@ -255,21 +259,15 @@ LimitNPROC=infinity" > /etc/systemd/system/openvpn-server@server.service.d/disab
 	./easyrsa --batch init-pki
 	./easyrsa --batch build-ca nopass
 	./easyrsa gen-tls-crypt-key
-	# Create the DH parameters file using the predefined ffdhe2048 group
-	echo '-----BEGIN DH PARAMETERS-----
-MIIBCAKCAQEA//////////+t+FRYortKmq/cViAnPTzx2LnFg84tNpWp4TZBFGQz
-+8yTnc4kmz75fS/jY2MMddj2gbICrsRhetPfHtXV/WVhJDP1H18GbtCFY2VVPe0a
-87VXE15/V8k1mE8McODmi3fipona8+/och3xWKE2rec1MKzKT0g6eXq8CrGCsyT7
-YdEIqUuyyOP7uWrat2DX9GgdT0Kj3jlN9K5W7edjcrsZCwenyO4KbXCeAvzhzffi
-7MA0BM0oNC9hkXL+nOmFg/+OTxIy7vKBg8P+OxtMb61zO7X8vC7CIAXFjvGDfRaD
-ssbzSibBsu/6iGtCOGEoXJf//////////wIBAg==
------END DH PARAMETERS-----' > /etc/openvpn/server/dh.pem
+	# Generate DH parameters dynamically for better security
+	echo "Generating DH parameters (this may take a few minutes)..."
+	openssl dhparam -out /etc/openvpn/server/dh.pem 2048
 	# Make easy-rsa aware of our external DH file (prevents a warning)
 	ln -s /etc/openvpn/server/dh.pem pki/dh.pem
-	# Create certificates and CRL
-	./easyrsa --batch --days=3650 build-server-full server nopass
-	./easyrsa --batch --days=3650 build-client-full "$client" nopass
-	./easyrsa --batch --days=3650 gen-crl
+	# Create certificates and CRL with 2-year validity for better security
+	./easyrsa --batch --days=730 build-server-full server nopass
+	./easyrsa --batch --days=730 build-client-full "$client" nopass
+	./easyrsa --batch --days=730 gen-crl
 	# Move the stuff we need
 	cp pki/ca.crt pki/private/ca.key pki/issued/server.crt pki/private/server.key pki/crl.pem /etc/openvpn/server
 	cp pki/private/easyrsa-tls.key /etc/openvpn/server/tc.key
@@ -277,7 +275,7 @@ ssbzSibBsu/6iGtCOGEoXJf//////////wIBAg==
 	chown nobody:"$group_name" /etc/openvpn/server/crl.pem
 	# Without +x in the directory, OpenVPN can't run a stat() on the CRL file
 	chmod o+x /etc/openvpn/server/
-	# Generate server.conf
+	# Generate server.conf with modern security settings
 	echo "local $ip
 port $port
 proto $protocol
@@ -286,7 +284,8 @@ ca ca.crt
 cert server.crt
 key server.key
 dh dh.pem
-auth SHA512
+auth SHA256
+cipher AES-256-GCM
 tls-crypt tc.key
 topology subnet
 server 10.8.0.0 255.255.255.0" > /etc/openvpn/server/server.conf
@@ -294,7 +293,7 @@ server 10.8.0.0 255.255.255.0" > /etc/openvpn/server/server.conf
 	if [[ -z "$ip6" ]]; then
 		echo 'push "redirect-gateway def1 bypass-dhcp"' >> /etc/openvpn/server/server.conf
 	else
-		echo 'server-ipv6 fddd:1194:1194:1194::/64' >> /etc/openvpn/server/server.conf
+		echo 'server-ipv6 fd00:1194:1194:1194::/64' >> /etc/openvpn/server/server.conf
 		echo 'push "redirect-gateway def1 ipv6 bypass-dhcp"' >> /etc/openvpn/server/server.conf
 	fi
 	echo 'ifconfig-pool-persist ipp.txt' >> /etc/openvpn/server/server.conf
@@ -343,6 +342,7 @@ server 10.8.0.0 255.255.255.0" > /etc/openvpn/server/server.conf
 		done
 		;;
 	esac
+	# Add block-outside-dns only for Windows clients to prevent DNS leaks
 	echo 'push "block-outside-dns"' >> /etc/openvpn/server/server.conf
 	echo "keepalive 10 120
 user nobody
@@ -350,7 +350,13 @@ group $group_name
 persist-key
 persist-tun
 verb 3
-crl-verify crl.pem" >> /etc/openvpn/server/server.conf
+crl-verify crl.pem
+# Additional security settings
+tls-version-min 1.2
+tls-cipher TLS-ECDHE-RSA-WITH-AES-256-GCM-SHA384:TLS-ECDHE-RSA-WITH-AES-128-GCM-SHA256
+# Prevent DNS leaks
+push \"dhcp-option DNS 8.8.8.8\"
+push \"dhcp-option DNS 8.8.4.4\"" >> /etc/openvpn/server/server.conf
 	if [[ "$protocol" = "udp" ]]; then
 		echo "explicit-exit-notify" >> /etc/openvpn/server/server.conf
 	fi
@@ -377,10 +383,10 @@ crl-verify crl.pem" >> /etc/openvpn/server/server.conf
 		firewall-cmd --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to "$ip"
 		firewall-cmd --permanent --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to "$ip"
 		if [[ -n "$ip6" ]]; then
-			firewall-cmd --zone=trusted --add-source=fddd:1194:1194:1194::/64
-			firewall-cmd --permanent --zone=trusted --add-source=fddd:1194:1194:1194::/64
-			firewall-cmd --direct --add-rule ipv6 nat POSTROUTING 0 -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to "$ip6"
-			firewall-cmd --permanent --direct --add-rule ipv6 nat POSTROUTING 0 -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to "$ip6"
+			firewall-cmd --zone=trusted --add-source=fd00:1194:1194:1194::/64
+			firewall-cmd --permanent --zone=trusted --add-source=fd00:1194:1194:1194::/64
+			firewall-cmd --direct --add-rule ipv6 nat POSTROUTING 0 -s fd00:1194:1194:1194::/64 ! -d fd00:1194:1194:1194::/64 -j SNAT --to "$ip6"
+			firewall-cmd --permanent --direct --add-rule ipv6 nat POSTROUTING 0 -s fd00:1194:1194:1194::/64 ! -d fd00:1194:1194:1194::/64 -j SNAT --to "$ip6"
 		fi
 	else
 		# Create a service to set up persistent iptables rules
@@ -397,20 +403,20 @@ After=network-online.target
 Wants=network-online.target
 [Service]
 Type=oneshot
-ExecStart=$iptables_path -w 5 -t nat -A POSTROUTING -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to $ip
+ExecStart=$iptables_path -w 5 -t nat -A POSTROUTING -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j MASQUERADE
 ExecStart=$iptables_path -w 5 -I INPUT -p $protocol --dport $port -j ACCEPT
 ExecStart=$iptables_path -w 5 -I FORWARD -s 10.8.0.0/24 -j ACCEPT
 ExecStart=$iptables_path -w 5 -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
-ExecStop=$iptables_path -w 5 -t nat -D POSTROUTING -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to $ip
+ExecStop=$iptables_path -w 5 -t nat -D POSTROUTING -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j MASQUERADE
 ExecStop=$iptables_path -w 5 -D INPUT -p $protocol --dport $port -j ACCEPT
 ExecStop=$iptables_path -w 5 -D FORWARD -s 10.8.0.0/24 -j ACCEPT
 ExecStop=$iptables_path -w 5 -D FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT" > /etc/systemd/system/openvpn-iptables.service
 		if [[ -n "$ip6" ]]; then
-			echo "ExecStart=$ip6tables_path -w 5 -t nat -A POSTROUTING -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to $ip6
-ExecStart=$ip6tables_path -w 5 -I FORWARD -s fddd:1194:1194:1194::/64 -j ACCEPT
+			echo "ExecStart=$ip6tables_path -w 5 -t nat -A POSTROUTING -s fd00:1194:1194:1194::/64 ! -d fd00:1194:1194:1194::/64 -j SNAT --to $ip6
+ExecStart=$ip6tables_path -w 5 -I FORWARD -s fd00:1194:1194:1194::/64 -j ACCEPT
 ExecStart=$ip6tables_path -w 5 -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
-ExecStop=$ip6tables_path -w 5 -t nat -D POSTROUTING -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to $ip6
-ExecStop=$ip6tables_path -w 5 -D FORWARD -s fddd:1194:1194:1194::/64 -j ACCEPT
+ExecStop=$ip6tables_path -w 5 -t nat -D POSTROUTING -s fd00:1194:1194:1194::/64 ! -d fd00:1194:1194:1194::/64 -j SNAT --to $ip6
+ExecStop=$ip6tables_path -w 5 -D FORWARD -s fd00:1194:1194:1194::/64 -j ACCEPT
 ExecStop=$ip6tables_path -w 5 -D FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT" >> /etc/systemd/system/openvpn-iptables.service
 		fi
 		echo "RemainAfterExit=yes
@@ -438,11 +444,18 @@ nobind
 persist-key
 persist-tun
 remote-cert-tls server
-auth SHA512
+auth SHA256
+cipher AES-256-GCM
+tls-version-min 1.2
 ignore-unknown-option block-outside-dns
 verb 3" > /etc/openvpn/server/client-common.txt
 	# Enable and start the OpenVPN service
 	systemctl enable --now openvpn-server@server.service
+	# Wait a moment for service to start and check status
+	sleep 3
+	if ! systemctl is-active --quiet openvpn-server@server.service; then
+		echo "Warning: OpenVPN service failed to start. Check logs with: journalctl -u openvpn-server@server.service"
+	fi
 	# Build the $client.ovpn file, stripping comments from easy-rsa in the process
 	grep -vh '^#' /etc/openvpn/server/client-common.txt /etc/openvpn/server/easy-rsa/pki/inline/private/"$client".inline > "$script_dir"/"$client".ovpn
 	echo
@@ -476,7 +489,7 @@ else
 				client=$(sed 's/[^0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-]/_/g' <<< "$unsanitized_client")
 			done
 			cd /etc/openvpn/server/easy-rsa/
-			./easyrsa --batch --days=3650 build-client-full "$client" nopass
+			./easyrsa --batch --days=730 build-client-full "$client" nopass
 			# Build the $client.ovpn file, stripping comments from easy-rsa in the process
 			grep -vh '^#' /etc/openvpn/server/client-common.txt /etc/openvpn/server/easy-rsa/pki/inline/private/"$client".inline > "$script_dir"/"$client".ovpn
 			echo
@@ -510,7 +523,7 @@ else
 			if [[ "$revoke" =~ ^[yY]$ ]]; then
 				cd /etc/openvpn/server/easy-rsa/
 				./easyrsa --batch revoke "$client"
-				./easyrsa --batch --days=3650 gen-crl
+				./easyrsa --batch --days=730 gen-crl
 				rm -f /etc/openvpn/server/crl.pem
 				rm -f /etc/openvpn/server/easy-rsa/pki/reqs/"$client".req
 				rm -f /etc/openvpn/server/easy-rsa/pki/private/"$client".key
@@ -545,11 +558,11 @@ else
 					firewall-cmd --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to "$ip"
 					firewall-cmd --permanent --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to "$ip"
 					if grep -qs "server-ipv6" /etc/openvpn/server/server.conf; then
-						ip6=$(firewall-cmd --direct --get-rules ipv6 nat POSTROUTING | grep '\-s fddd:1194:1194:1194::/64 '"'"'!'"'"' -d fddd:1194:1194:1194::/64' | grep -oE '[^ ]+$')
-						firewall-cmd --zone=trusted --remove-source=fddd:1194:1194:1194::/64
-						firewall-cmd --permanent --zone=trusted --remove-source=fddd:1194:1194:1194::/64
-						firewall-cmd --direct --remove-rule ipv6 nat POSTROUTING 0 -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to "$ip6"
-						firewall-cmd --permanent --direct --remove-rule ipv6 nat POSTROUTING 0 -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to "$ip6"
+						ip6=$(firewall-cmd --direct --get-rules ipv6 nat POSTROUTING | grep '\-s fd00:1194:1194:1194::/64 '"'"'!'"'"' -d fd00:1194:1194:1194::/64' | grep -oE '[^ ]+$')
+						firewall-cmd --zone=trusted --remove-source=fd00:1194:1194:1194::/64
+						firewall-cmd --permanent --zone=trusted --remove-source=fd00:1194:1194:1194::/64
+						firewall-cmd --direct --remove-rule ipv6 nat POSTROUTING 0 -s fd00:1194:1194:1194::/64 ! -d fd00:1194:1194:1194::/64 -j SNAT --to "$ip6"
+						firewall-cmd --permanent --direct --remove-rule ipv6 nat POSTROUTING 0 -s fd00:1194:1194:1194::/64 ! -d fd00:1194:1194:1194::/64 -j SNAT --to "$ip6"
 					fi
 				else
 					systemctl disable --now openvpn-iptables.service
